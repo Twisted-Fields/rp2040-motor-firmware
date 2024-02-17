@@ -58,6 +58,11 @@ float motor2_acceleration = 0.0;
 #define FIRMWARE_UPDATE 7
 #define FIRMWARE_UPDATE_CPU2 8
 #define SIMPLE_PING 9
+#define LOG_REQUEST 10
+#define RAW_BRIDGE_COMMAND 11
+#define FIRMWARE_STATUS 12
+#define SET_STEERING_ZERO 13
+#define CLEAR_ERRORS 14
 
 const byte ACK[] = {0xAC, 0x12};
 
@@ -74,12 +79,44 @@ const byte ACK[] = {0xAC, 0x12};
 #define ADC_MOTOR_TH2 A3
 #define LED_PIN 15
 #define LED_COUNT 3
+#define ESTOP_DURATION_MS 200
+
+bool estop_status = false;
+
+#define RED 0xFF0000
+#define GREEN 0x00FF00
+#define BLUE 0x0000FF
+#define YELLOW 0xFFFF00
+#define CYAN 0x00FFFF
+#define MAGENTA 0xFF00FF
+#define WHITE 0xFFFFFF
+#define BLACK 0x000000
+
+volatile int last_estop_val = 0;
+volatile unsigned long estop_last_millis = 0;
+
+
+uint32_t led_1_color = Adafruit_NeoPixel::Color(0, 0, 0);
+uint32_t led_2_color = Adafruit_NeoPixel::Color(0, 0, 0);
+uint32_t led_3_color = Adafruit_NeoPixel::Color(0, 0, 0);
 
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 int sendcount = 0;
 int readcount = 0;
 
+
+#define LOGGING_DIVIDER '#'
+#define LOGGER_LENGTH 2000
+#define LOGGER_FULL "LOGGER FULL" + LOGGING_DIVIDER
+#define LOGGER_FULL_LEN LOGGER_LENGTH - strlen(LOGGER_FULL)
+char logger_string[LOGGER_LENGTH] = "";
+uint32_t logger_index = 0;
+bool logger_filled = false;
+
+
+#define PRINT_LOGGING true
+#define USE_CAN_CPU_LOGGING  true
 
 #define SERIAL_SPEED 921600
 
@@ -102,6 +139,43 @@ void debug_print(String text){
   }
 }
 
+void log_string(const char* text);
+void log_string(String text);
+
+void log_string(String text)
+{
+  char char_array[text.length()+1];
+  text.toCharArray(char_array, text.length()+1);
+  log_string(char_array);
+}
+
+void log_string(const char* text)
+{
+
+  uint32_t text_len = strlen(text);
+  uint32_t updated_index = logger_index + text_len + 1;
+  if(logger_filled == false && updated_index > LOGGER_FULL_LEN)
+  {
+    memcpy(logger_string + logger_index, LOGGER_FULL, strlen(LOGGER_FULL));
+    logger_filled = true;
+  }
+  if(!logger_filled)
+  {
+    memcpy(logger_string + logger_index, text, text_len);
+    logger_index = updated_index;
+    logger_string[logger_index - 1] = LOGGING_DIVIDER;
+  }
+  if(PRINT_LOGGING)
+  {
+    if(logger_filled)
+    {
+      debug_print(LOGGER_FULL);
+    }
+    debug_print(text);
+  }
+
+}
+
 void exception_handler()
 {
   rp2040.reboot();
@@ -118,8 +192,30 @@ void setLEDs(uint32_t color) {
   for (int i = 0; i < strip.numPixels(); i++) {
     strip.setPixelColor(i, color);
   }
+  strip.setPixelColor(2, strip.Color(estop_status ? 0 : 255, 0, 0));
   strip.show();
 }
+
+void updateLEDs() {
+  
+  strip.setPixelColor(0, led_1_color);
+  strip.setPixelColor(1, led_2_color);
+  strip.setPixelColor(2, led_3_color);
+  strip.show();
+}
+
+void handle_estop()
+{
+  int estop_val = digitalRead(ESTOP_SQUARE_INPUT);
+  if (estop_val != last_estop_val)
+  {
+    last_estop_val = estop_val;
+    estop_last_millis = millis();
+  }
+
+}
+
+
 
 void setup()
 {
@@ -136,6 +232,13 @@ void setup()
   delay(100);
   setLEDs(strip.Color(0,0,255));
   delay(100);
+  setLEDs(strip.Color(0,255,255));
+  delay(100);
+  setLEDs(strip.Color(51,0,255));
+  delay(100);
+  setLEDs(strip.Color(100,97,0));
+  delay(100);
+
 
   exception_set_exclusive_handler(HARDFAULT_EXCEPTION, exception_handler);
 
@@ -180,6 +283,8 @@ void setup()
   pinMode(CAN_ID_1, INPUT);
   pinMode(CAN_ID_2, INPUT);
   pinMode(CAN_ID_3, INPUT);
+
+  attachInterrupt(digitalPinToInterrupt(ESTOP_SQUARE_INPUT), handle_estop, CHANGE);
   
   rx_can_id = CAN_BASE_ADDRESS + (digitalRead(CAN_ID_1)<<2 | digitalRead(CAN_ID_2)<<1 | digitalRead(CAN_ID_3));
 
@@ -210,7 +315,7 @@ void setup()
   CAN0.init_Filt(5,0,rx_can_id << 16);                // Init sixth filter...
 
 
-  txMsg.Buffer = (uint8_t *)calloc(1000, sizeof(uint8_t));
+  txMsg.Buffer = (uint8_t *)calloc(10010, sizeof(uint8_t));
   rxMsg.Buffer = (uint8_t *)calloc(MAX_MSGBUF, sizeof(uint8_t));
 
   rxMsg.tx_id = tx_can_id;
@@ -255,9 +360,8 @@ void print_buffer(INT32U id, uint8_t *buffer, uint32_t len, SerialUART uart)
 
 
 int count = 0;
-int last_estop_val = 0;
-unsigned long estop_last_millis = 0;
 bool motion_allowed = true;
+uint32_t max_estop_duration = 0;
 
 long ts = millis();
 
@@ -313,7 +417,23 @@ void send_ping_reply(bool got_motor_ack)
     isotp.send(&txMsg);
 }
 
-void send_sensors_can(float system_voltage)
+void send_logging_reply(byte* log_array, uint32_t length)
+{
+    txMsg.Buffer[0] = rx_can_id;
+    txMsg.Buffer[1] = LOG_REQUEST | 0x80;
+    memcpy (txMsg.Buffer+2, log_array, length);
+
+    // debug_print("length: " + String(length));
+
+    txMsg.len = length + 2;
+    txMsg.tx_id = tx_can_id;
+    txMsg.rx_id = rx_can_id;
+    sendcount += 1;
+    isotp.send(&txMsg);
+}
+
+// TODO: Some of the stuff that says motor1 is really motor2 and should just be changed to drive_motor
+void send_sensors_can(float system_voltage, float motor1_current, float motor1_voltage, int32_t drive_motor_position, int32_t encoder_pulse_counter, float motor1_velocity, uint8_t error_codes)
 {
       for (int i = 26; i < 30; ++i) {
       gpio_disable_pulls(i);
@@ -353,17 +473,22 @@ void send_sensors_can(float system_voltage)
     txMsg.Buffer[9] = byte(motor1_temp);
     txMsg.Buffer[10] = byte(motor2_temp);
     memcpy (txMsg.Buffer+11, &system_voltage, 4);
+    memcpy (txMsg.Buffer+15, &motor1_current, 4);
+    memcpy (txMsg.Buffer+19, &motor1_voltage, 4);
+    memcpy (txMsg.Buffer+23, &drive_motor_position, 4);
+    memcpy (txMsg.Buffer+27, &encoder_pulse_counter, 4);
+    memcpy (txMsg.Buffer+31, &motor1_velocity, 4);
+    txMsg.Buffer[35] = error_codes;
+
 
     uint32_t crc;
-    crc =  crc16(txMsg.Buffer, 16, 0x1021);
-    txMsg.Buffer[16] = (uint8_t)(0xFF & crc);
-    txMsg.Buffer[17] = (uint8_t)(0xFF & crc>>8);
+    crc =  crc16(txMsg.Buffer, 36, 0x1021);
+    txMsg.Buffer[36] = (uint8_t)(0xFF & crc);
+    txMsg.Buffer[37] = (uint8_t)(0xFF & crc>>8);
 
-    print_buffer(txMsg.rx_id, txMsg.Buffer, 18, UART_DEBUG);
+    print_buffer(txMsg.rx_id, txMsg.Buffer, 38, UART_DEBUG);
     
-
-
-    txMsg.len = 20;
+    txMsg.len = 40;
     txMsg.tx_id = tx_can_id;
     txMsg.rx_id = rx_can_id;
     // print_buffer(txMsg.rx_id, txMsg.Buffer, txMsg.len, UART_DEBUG);
@@ -372,6 +497,12 @@ void send_sensors_can(float system_voltage)
     isotp.send(&txMsg);
 }
 
+
+#define SEND_THERMISTOR_TO_MOTOR_MCU false
+
+
+
+
 void loop()
 {
 
@@ -379,20 +510,30 @@ void loop()
   rxMsg.rx_id = rx_can_id;
   // CAN0.mcp2515_write_id(0x1, 0,rx_can_id);
 
-  motion_allowed = (millis() - estop_last_millis < 100);
-  int estop_val = digitalRead(ESTOP_SQUARE_INPUT);
-  if (estop_val != last_estop_val)
+
+
+  int32_t estop_duration = millis() - estop_last_millis; // This value is signed because occasionally the result is negative.
+  if(estop_duration > max_estop_duration)
   {
-    // debug_print("Estop val: ");
-    // debug_print(String(estop_val));
-    last_estop_val = estop_val;
-    estop_last_millis = millis();
+    max_estop_duration = estop_duration;
   }
-  // if (millis() - ts > 20)
-  // {
-  //   ts = millis();
-  // debug_print("loop");
-  // }
+  bool motion_tmp = (estop_duration < ESTOP_DURATION_MS);
+  if(motion_tmp!=motion_allowed)
+  {
+    motion_allowed = motion_tmp;
+    if(!motion_allowed)
+    {
+      // log_string("Motion disabled.");
+    }
+  }
+
+    if (ts + 1000uL <= millis()) {
+    ts = millis();
+    // String myStr;    /*New string is defined*/
+    // myStr = String(max_estop_duration);   /*Convert Int to String*/
+    // log_string(String(max_estop_duration));
+    max_estop_duration = 0;
+  }
 
 
 
@@ -402,37 +543,38 @@ void loop()
   //   ts = millis();
 
   //   debug_print("rx_can_id: " + String(rx_can_id));
-  //   // bool estop_status = digitalRead(ESTOP_SWITCH_STATUS);
-  //   // setRingRed(estop_status);
-
-  //   // debug_print("ESTOP_SWITCH_STATUS: " + String(estop_status));
-
-  //   float thermistor_1 = read_spi_thermistor(THERM_ADC_CS1);
-  //   float thermistor_2 = read_spi_thermistor(THERM_ADC_CS2);
-
-  //    debug_print("temp: " + String(thermistor_1) + " | temp2: " + String(thermistor_2));
-  //    debug_print("temp: " + String(byte(thermistor_1)) + " | temp2: " + String(byte(thermistor_2)));
-  //    debug_print("-------");
-  // }
-
-  // // print motion allowed every 0.1s
-  // if (millis() - ts > 100)
-  // {
-  //   ts = millis();
-  //   if (motion_allowed)
-  //   {
-  //     debug_print("Motion allowed.");
-  //   }
-  //   else
-  //   {
-  //     debug_print("Motion not allowed.");
-  //   }
-  // }
+    estop_status = digitalRead(ESTOP_SWITCH_STATUS);
+    if(estop_status)
+    {
+      led_1_color = GREEN;
+    } else
+    {
+      led_1_color = RED;
+    }
+    if(motion_allowed)
+    {
+      led_3_color = GREEN;
+    } else
+    {
+      led_3_color = RED;
+    }
+    updateLEDs();
 
 
-  // debug_print("send_sensors");
-  // send_sensors_can();
-  // delay(2000);
+    if (SEND_THERMISTOR_TO_MOTOR_MCU)
+    {
+
+    if (millis() - ts > 100)
+    {
+      ts = millis();
+      float thermistor_1 = read_spi_thermistor(THERM_ADC_CS1);
+      float thermistor_2 = read_spi_thermistor(THERM_ADC_CS2);
+
+      UART_INTERCHIP.print(String("temp1: " + String(thermistor_1) + ", temp2: " + String(thermistor_2) + "\n"));
+
+    }
+
+    }
 
   
   if(CAN0.checkReceive() == CAN_MSGAVAIL)
@@ -449,8 +591,8 @@ void loop()
 
     if(isotp.receive(&rxMsg)==0)
     {
-      setLEDs(strip.Color(0,255,0));
-      debug_print("ISOTP_RECEIVE");
+      led_2_color = strip.Color(0,255,0);
+      debug_print("ISOTP_RECEIVE Command: " + String(rxMsg.Buffer[0]));
       // delay(500);
       // readcount += 1;
       // debug_print("Received buffer of len: ");
@@ -461,47 +603,61 @@ void loop()
       {
         if (rxMsg.Buffer[0] == SEND_COMPLETE_SETTINGS)
         {
-          // UART_DEBUG.println("GOT MESSAGE");
-          // mbed::MbedCRC <POLY_16BIT_CCITT, 16> sd(0, 0, false, false);
-
+          debug_print("SEND_COMPLETE_SETTINGS");
           send_buffer_interchip();
-
-          // motor1_setpoint_mode = rxMsg.Buffer[1];
-          // memcpy (&motor1_setpoint, rxMsg.Buffer + 2, 4);
-          // memcpy (&motor1_max_velocity, rxMsg.Buffer + 6, 4);
-          // memcpy (&motor1_max_torque, rxMsg.Buffer + 10, 4);
-          // memcpy (&motor1_acceleration, rxMsg.Buffer + 14, 4);
-          // motor2_setpoint_mode = rxMsg.Buffer[18];
-          // memcpy (&motor2_setpoint, rxMsg.Buffer + 19, 4);
-          // memcpy (&motor2_max_velocity, rxMsg.Buffer + 23, 4);
-          // memcpy (&motor2_max_torque, rxMsg.Buffer + 27, 4);
-          // memcpy (&motor2_acceleration, rxMsg.Buffer + 31, 4);
-          // Serial.println(motor2_max_velocity);
         }
-        if ((rxMsg.Buffer[0] & 0x7F) == SEND_BASIC_UPDATE)
+        else if ((rxMsg.Buffer[0] & 0x7F) == SEND_BASIC_UPDATE)
         {
-
+          debug_print("SEND_BASIC_UPDATE");
           send_buffer_interchip();
 
-          if(rxMsg.Buffer[0] & 0x40)
+          if(rxMsg.Buffer[0] & 0x40) // TODO document what this is doing.
           {
             char rxbuf[4];
             UART_INTERCHIP.readBytes(rxbuf, 4);
-            send_sensors_can(reinterpret_cast<float &>( rxbuf));
+            float system_voltage = reinterpret_cast<float &>( rxbuf);
+            UART_INTERCHIP.readBytes(rxbuf, 4);
+            float motor1_current = reinterpret_cast<float &>( rxbuf);
+            UART_INTERCHIP.readBytes(rxbuf, 4);
+            float motor1_voltage = reinterpret_cast<float &>( rxbuf);
+            UART_INTERCHIP.readBytes(rxbuf, 4);
+            int32_t drive_motor_position = reinterpret_cast<int32_t &>( rxbuf);
+            UART_INTERCHIP.readBytes(rxbuf, 4);
+            int32_t encoder_pulse_counter = reinterpret_cast<int32_t &>( rxbuf);
+            UART_INTERCHIP.readBytes(rxbuf, 4);
+            float motor1_velocity = reinterpret_cast<float &>( rxbuf);
+            UART_INTERCHIP.readBytes(rxbuf, 1);
+            uint8_t error_codes = rxbuf[0];
+            send_sensors_can(system_voltage, motor1_current, motor1_voltage, drive_motor_position, encoder_pulse_counter, motor1_velocity, error_codes);
           }
 
         }
-        if (rxMsg.Buffer[0] == REQUEST_SENSORS)
+        else  if (rxMsg.Buffer[0] == REQUEST_SENSORS)
         {
+          debug_print("REQUEST_SENSORS");
           send_buffer_interchip();
           char rxbuf[4];
           UART_INTERCHIP.readBytes(rxbuf, 4);
-          send_sensors_can(reinterpret_cast<float &>( rxbuf));
-
+          float system_voltage = reinterpret_cast<float &>( rxbuf);
+          UART_INTERCHIP.readBytes(rxbuf, 4);
+          float motor1_current = reinterpret_cast<float &>( rxbuf);
+          UART_INTERCHIP.readBytes(rxbuf, 4);
+          float motor1_voltage = reinterpret_cast<float &>( rxbuf);
+          UART_INTERCHIP.readBytes(rxbuf, 4);
+          int32_t drive_motor_position = reinterpret_cast<int32_t &>( rxbuf);
+          UART_INTERCHIP.readBytes(rxbuf, 4);
+          int32_t encoder_pulse_counter = reinterpret_cast<int32_t &>( rxbuf);
+          UART_INTERCHIP.readBytes(rxbuf, 4);
+          float motor1_velocity = reinterpret_cast<float &>( rxbuf);
+          UART_INTERCHIP.readBytes(rxbuf, 1);
+          uint8_t error_codes = rxbuf[0];
+          debug_print("drive_motor_position: " + String(drive_motor_position) + ", encoder_pulse_counter: " + String(encoder_pulse_counter) + ", motor1_velocity: " + String(motor1_velocity));
+          send_sensors_can(system_voltage, motor1_current, motor1_voltage, drive_motor_position, encoder_pulse_counter, motor1_velocity, error_codes);
 
         }
-        if (rxMsg.Buffer[0] == SIMPLE_PING)
+        else if (rxMsg.Buffer[0] == SIMPLE_PING)
         {
+          debug_print("SIMPLE_PING");
           send_buffer_interchip();
           byte rxbuf[2];
           UART_INTERCHIP.readBytes(rxbuf, 2);
@@ -513,9 +669,55 @@ void loop()
             send_ping_reply(false);
           }
         }
-        if (rxMsg.Buffer[4] == SIMPLEFOC_PASS_THROUGH)
+        else if (rxMsg.Buffer[0] == CLEAR_ERRORS)
         {
+          debug_print("CLEAR_ERRORS");
+          send_buffer_interchip();
+        }
+        else if (rxMsg.Buffer[0] == LOG_REQUEST)
+        {
+          debug_print("LOG_REQUEST");
+          if(USE_CAN_CPU_LOGGING)
+          {
+            send_logging_reply((byte *)logger_string, logger_index);
+            logger_index = 0;
+            logger_filled = false;
+          } else
+          {
+          send_buffer_interchip();
+          byte rxbuf[2];
+          UART_INTERCHIP.readBytes(rxbuf, 2);
+          uint32_t buflen = rxbuf[0] | rxbuf[1]<<8;
+          // debug_print("LOG_LENGTH: " + String(buflen));
+          byte rxbuf2[buflen];
+          UART_INTERCHIP.readBytes(rxbuf2, buflen);
+          send_logging_reply(rxbuf2, buflen);
+          }
 
+        }
+        else if (rxMsg.Buffer[0] == FIRMWARE_STATUS)
+        {
+          debug_print("FIRMWARE_STATUS");
+          send_buffer_interchip();
+          // TODO: Complete this stub.
+        }
+        else if (rxMsg.Buffer[0] == SET_STEERING_ZERO)
+        {
+          debug_print("SET_STEERING_ZERO");
+          send_buffer_interchip();
+          byte rxbuf[2];
+          UART_INTERCHIP.readBytes(rxbuf, 2);
+          if(rxbuf[0] == ACK[0] && rxbuf[1] == ACK[1])
+          {
+            send_ping_reply(true);
+          } else
+          {
+            send_ping_reply(false);
+          }
+        }
+        else if (rxMsg.Buffer[0] == SIMPLEFOC_PASS_THROUGH)
+        {
+          debug_print("SIMPLEFOC_PASS_THROUGH");
           if (UART_INTERCHIP.available() > 0) {
             UART_INTERCHIP.read();
           }
@@ -534,15 +736,24 @@ void loop()
           txMsg.tx_id = tx_can_id;
           txMsg.rx_id = rx_can_id;
           isotp.send(&txMsg);
-
-
+ 
+        } else if (rxMsg.Buffer[0] == RAW_BRIDGE_COMMAND)
+        {
+          debug_print("RAW_BRIDGE_COMMAND");
+          // debug_print("Raw bridge command");
+          send_buffer_interchip();
+        }
+        else
+        {
+          debug_print("UNKNOWN COMMAND");
+          print_buffer(rxMsg.rx_id, rxMsg.Buffer, rxMsg.len, UART_DEBUG);
         }
       }else
       {
      
         if (rxMsg.Buffer[4] == FIRMWARE_UPDATE)
         {
-
+            debug_print("FIRMWARE_UPDATE");
             debug_print("Writing OTA image...");
             LittleFS.begin();
             File f = LittleFS.open("ota.bin", "w");
@@ -581,7 +792,7 @@ void loop()
     } else
     {
 
-      setLEDs(strip.Color(255,0,255));
+      led_2_color = strip.Color(255,0,255);
 
     }
   }

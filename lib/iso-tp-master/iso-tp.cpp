@@ -89,9 +89,45 @@ uint8_t IsoTp::send_ff(struct Message_t *msg) // Send FF
   uint8_t TxBuf[8]={0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
   msg->seq_id=1;
 
-  TxBuf[0]=(N_PCI_FF | ((msg->len&0x0F00) >> 8));
-  TxBuf[1]=(msg->len&0x00FF);
-  memmove(TxBuf+2,msg->Buffer,6);             // Skip 2 Bytes PCI
+  if(msg->len <= 4095)
+  {
+    TxBuf[0]=(N_PCI_FF | ((msg->len&0x0F00) >> 8));
+    TxBuf[1]=(msg->len&0x00FF);
+    memmove(TxBuf+2,msg->Buffer,6);             // Skip 2 Bytes PCI
+  } else
+  {
+    TxBuf[0] = N_PCI_FF;
+    TxBuf[1] = 0;
+    TxBuf[2] = (uint8_t)((msg->len >> 24) & 0xFF);
+    TxBuf[3] = (uint8_t)((msg->len >> 16) & 0xFF);
+    TxBuf[4] = (uint8_t)((msg->len >> 8) & 0xFF);
+    TxBuf[5] = (uint8_t)(msg->len & 0xFF);
+    TxBuf[6] = msg->Buffer[0];
+    TxBuf[7] = msg->Buffer[1];
+  }
+  
+  
+  
+
+
+  // /* get the FF_DL */
+  // msg->len = (rxBuffer[0] & 0x0F) << 8;
+  // msg->len += rxBuffer[1];
+
+	// /* Check for FF_DL escape sequence supporting 32 bit PDU length */
+	// if (msg->len != 0) {
+	// 	rest=msg->len;
+	// } else {
+	// 	/* FF_DL = 0 => get real length from next 4 bytes */
+	// 	msg->len = rxBuffer[2] << 24;
+	// 	msg->len += rxBuffer[3] << 16;
+	// 	msg->len += rxBuffer[4] << 8;
+	// 	msg->len += rxBuffer[5];
+	// 	rest=msg->len+4;
+	// }
+
+
+  
   return can_send(msg->tx_id,8,TxBuf);       // First Frame has full length
 }
 
@@ -339,6 +375,7 @@ uint8_t IsoTp::send(Message_t* msg)
   uint8_t bs=false;
   INT32U delta=0;
   uint8_t retval=0;
+  uint8_t *Buffer_start = msg->Buffer;
 
   msg->tp_state=ISOTP_SEND;
 
@@ -370,8 +407,17 @@ uint8_t IsoTp::send(Message_t* msg)
 #endif
                                    if(!(retval=send_ff(msg))) // FF complete
                                    {
+                                    if(msg->len > 4095)
+                                    { 
+                                      msg->Buffer+=2;
+                                      msg->len-=2;
+
+                                    } else
+                                    {
                                      msg->Buffer+=6;
                                      msg->len-=6;
+                                    }
+
                                      msg->tp_state=ISOTP_WAIT_FIRST_FC;
                                      fc_wait_frames=0;
                                      wait_fc=millis();
@@ -480,7 +526,11 @@ uint8_t IsoTp::send(Message_t* msg)
       }
     }
   }
-
+  // Code above actually changes the value of the buffer
+  // pointer. A better fix than the following line would
+  // be to fix that code so it does not change the buffer
+  // value.
+  msg->Buffer = Buffer_start;
   return retval;
 }
 
