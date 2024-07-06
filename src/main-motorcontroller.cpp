@@ -17,6 +17,19 @@
 #include "CRC.h"
 
 #include "encoders/mt6701/MagneticSensorMT6701SSI.h"
+#include <Wire.h>
+
+#include <Adafruit_ADS1X15.h>
+
+
+/*
+
+TODO: Should monitor for induction sensor health perhaps by checking the magnetic
+sensors as a backup and throwing an error if incorrect motion is detected, or 
+with a timer if no motion is detected.
+
+*/
+
 
 /*
  IMPORTANT: Twisted fields controller uses active-low polarity for low-side switches! 
@@ -29,9 +42,20 @@
 
 
 #define PRE_INITIALIZED_STARTUP true
-#define DISABLE_ESTOP true
+#define DISABLE_ESTOP false
+#define FLIP_STEERING true //true for motor above bearing designs, false for motor below bearing designs like Woody
+#define SHOW_STEERING_DEBUGGING false
+#define SHOW_STEERING_DEBUGGING_MOVEMENT false
+#define SHOW_DRIVE_DEBUGGING false
+
+
+uint32_t last_steer_debug_print_time = 0;
+
+
 #define MINIMUM_ALLOWED_MOTOR_VOLTAGE 10.0f
 #define RESUME_MOTOR_VOLTAGE 12.0f
+
+
 
 #define ESTOP_DURATION_MS 200
 #define MOTOR_COMMAND_DURATION_MS 500
@@ -56,6 +80,7 @@
 #define DEGREES_TO_RADIANS 0.01745329251f 
 
 const byte ACK[] = {0xAC, 0x12};
+const byte NACK[] = {0x00, 0x00};
 
 #define MAXIMUM_ABSOLUTE_DRIVE_VELOCITY 200.0f
 
@@ -63,6 +88,7 @@ const byte ACK[] = {0xAC, 0x12};
 #define ERROR_CODE_MOTOR1_OVERSPEED 0x01
 #define ERROR_CODE_INVALID_SPEED_COMMAND 0x02
 #define ERROR_CODE_INCONSISTENT_COMMS 0x04
+#define ERROR_CODE_INDUCTION_ENCODER_OFFLINE 0x08
 
 #define OVERSPEED_DURATION_ALLOWANCE_MS 1000
 #define OVERSPEED_VEL_ALLOWANCE 5.0f
@@ -81,7 +107,7 @@ const byte ACK[] = {0xAC, 0x12};
 #define LOG_REQUEST 10
 #define RAW_BRIDGE_COMMAND 11
 #define FIRMWARE_STATUS 12
-#define SET_STEERING_ZERO 13
+#define SET_STEERING_HOME 13
 #define CLEAR_ERRORS 14
 
 byte  motor1_setpoint_mode = 0;
@@ -115,50 +141,18 @@ bool logger_filled = false;
 
 #define PRINT_LOGGING true
 
-#define INDUCTIVE_ENCODER false
+#define INDUCTIVE_ENCODER
+
+#define USE_ESTOP_AS_PROFILE_PIN false
 
 
-// motor 0
-// Encoder sensor0 = Encoder(ENCODER0_A_PIN, ENCODER0_B_PIN, 1024, ENCODER0_Z_PIN);
+
+// TODO: motor1 and motor2 got all mixed up in the code. Need to fix this!
+// Should change to "Drive" and "Steering".
 
 BLDCDriver6PWM driver1 = BLDCDriver6PWM(M1_INUH_PIN, M1_INUL_PIN, M1_INVH_PIN, M1_INVL_PIN, M1_INWH_PIN, M1_INWL_PIN);
 HallSensor sensor1 = HallSensor(ENCODER1_A_PIN, ENCODER1_B_PIN, ENCODER1_Z_PIN, MOTOR_PP);
-volatile int encoder_pulse_counter = 0;
 
-#ifdef INDUCTIVE_ENCODER
-#define ENCODER_RX 21
-#define ENCODER_TX 20
-SoftwareSerial encoder_software_serial(ENCODER_RX, ENCODER_TX); // RX, TX
-uint32_t encoder_ts = 0; // time tick for encoder read in main loop
-float encoder_angle = 0.0f;
-#else
-volatile bool a_active = false;
-volatile bool b_active = false;
-
-void handleA0() { 
-bool A = digitalRead(ENCODER0_A_PIN);
-if(A!=a_active){
-  encoder_pulse_counter += (a_active == b_active) ? 1 : -1;
-  a_active = A;
-};
-};
-
-void handleB0() { 
-bool B = digitalRead(ENCODER0_B_PIN);
-if(B!=b_active){
-  encoder_pulse_counter += (b_active != a_active) ? 1 : -1;
-  b_active = B;
-};
-};
-
-void setup_encoder()
-{
-pinMode(ENCODER0_A_PIN, INPUT);
-pinMode(ENCODER0_B_PIN, INPUT);
-attachInterrupt(digitalPinToInterrupt(ENCODER0_A_PIN), handleA0, CHANGE);
-attachInterrupt(digitalPinToInterrupt(ENCODER0_B_PIN), handleB0, CHANGE);
-}
-#endif
 
 void handleA1() { sensor1.handleA(); };
 void handleB1() { sensor1.handleB(); };
@@ -242,7 +236,7 @@ void log_string(const char* text)
   uint32_t updated_index = logger_index + text_len + 1;
   if(logger_filled == false && updated_index > LOGGER_FULL_LEN)
   {
-    memcpy(logger_string + logger_index, LOGGER_FULL, strlen(LOGGER_FULL));
+    memcpy(logger_string + logger_index, (char *)LOGGER_FULL, strlen((char *)LOGGER_FULL));
     logger_filled = true;
   }
   if(!logger_filled)
@@ -261,6 +255,163 @@ void log_string(const char* text)
   }
 
 }
+
+#ifdef INDUCTIVE_ENCODER
+
+#define CALIBRATE_SENSOR false
+
+#define MAG_NEUTRAL 13222
+
+#define DEFAULT_STEERING_ANGLE_OFFSET_DEGREES (-17.0)
+
+#define DEFAULT_STEERING_ANGLE_OFFSET_RADIANS (DEFAULT_STEERING_ANGLE_OFFSET_DEGREES * DEGREES_TO_RADIANS)
+
+uint32_t last_encoder_sample_millis = 0;
+uint32_t encoder_ts = 0; // time tick for encoder read in main loop
+float encoder_angle = 0.0f;
+
+Adafruit_ADS1115 ads_encoder;
+Adafruit_ADS1115 ads_mag_1;
+Adafruit_ADS1115 ads_mag_2; 
+
+int sinMin = 0, sinMax = 0;
+int cosMin = 0, cosMax = 0;
+
+bool sensor_calibrated = false;
+int angle_phase = 0;
+float angle_loop_offset_degrees = 0;
+float last_steering_raw_angle_degrees = 0;
+bool angle_phase_detected = false;
+float steering_angle_radians = 0.0f;
+float steering_home_offset_radians = 0.0f;
+bool induction_encoder_setup_complete = false;
+bool induction_encoder_homing_complete = false;
+
+
+
+void save_encoder_calibration(char* value)
+// Saves the calibration to SPI Flash using LittleFS
+{
+  LittleFS.begin();
+  File file = LittleFS.open("encoder_calibration.txt", "w");
+  if (!file) {
+    log_string("Failed to open file for writing.");
+    log_string("Calibration not saved!");
+    return;
+  }
+  file.print(sinMin);
+  file.print(",");
+  file.print(sinMax);
+  file.print(",");
+  file.print(cosMin);
+  file.print(",");
+  file.print(cosMax);
+  file.close();
+  LittleFS.end();
+  log_string("Saved calibration values:");
+  log_string("sinMin: " + String(sinMin));
+  log_string("sinMax: " + String(sinMax));
+  log_string("cosMin: " + String(cosMin));
+  log_string("cosMax: " + String(cosMax));
+  // log_string("Direction: " + String((Direction)direction));
+}
+
+void clear_encoder_calibration(char* value)
+{
+  sinMin = 0;
+  sinMax = 0;
+  cosMin = 0;
+  cosMax = 0;
+  sensor_calibrated = false;
+  log_string("Encoder calibration cleared.");
+  save_encoder_calibration((char*)(""));
+}
+
+void init_encoder_from_saved_calibration()
+// Initializes motor using calibration from SPI Flash with LittleFS
+{
+  LittleFS.begin();
+  File file = LittleFS.open("encoder_calibration.txt", "r");
+  if (!file) {
+    log_string("Failed to open file for reading");
+    return;
+  }
+  String line = file.readStringUntil('\n');
+  file.close();
+  LittleFS.end();
+
+  log_string("FULL CALIBRATION STRING:");
+  log_string(line);
+
+  int comma = line.indexOf(',');
+  sinMin = line.substring(0, comma).toInt();
+  int next_start = comma + 1;
+  comma = line.indexOf(',', next_start);
+  sinMax = line.substring(next_start, comma).toInt();
+  next_start = comma + 1;
+  comma = line.indexOf(',', next_start);
+  cosMin = line.substring(next_start, comma).toInt();
+  next_start = comma + 1;
+  comma = line.indexOf(',', next_start);
+  cosMax = line.substring(next_start, comma).toInt();
+  log_string("Initializing motor from saved calibration...");
+  log_string("Loaded calibration values:");
+  log_string("sinMin: " + String(sinMin));
+  log_string("sinMax: " + String(sinMax));
+  log_string("cosMin: " + String(cosMin));
+  log_string("cosMax: " + String(cosMax));
+  // log_string("Direction: " + String((Direction)direction));
+
+}
+
+bool setup_induction_encoder()
+{
+  
+  ads_encoder.setGain(GAIN_ONE);    // 1x gain   +/- 4.096V  1 bit = 2mV  0.125mV
+  ads_mag_1.setGain(GAIN_ONE);      // 1x gain   +/- 4.096V  1 bit = 2mV  0.125mV
+  ads_mag_2.setGain(GAIN_ONE);      // 1x gain   +/- 4.096V  1 bit = 2mV  0.125mV
+
+  Wire.setSDA(20);
+  Wire.setSCL(21);
+  Wire.setClock(50000); // 50kHz I2C clock
+  Wire.begin();
+
+  bool setup_okay = true;
+   
+    if (!ads_encoder.begin(0x48))
+    {
+      log_string("Failed to initialize ads_encoder.");
+      setup_okay = false;
+    }
+    if (!ads_mag_1.begin(0x4A))
+    {
+      log_string("Failed to initialize ads_mag_1.");
+      setup_okay = false;
+    }
+    if (!ads_mag_2.begin(0x49))
+    {
+      log_string("Failed to initialize ads_mag_2.");
+      setup_okay = false;
+    }
+
+  if(!setup_okay)
+  {
+    log_string("Failed to initialize all ads1115 devices.");
+    return false;
+  }
+
+
+  if(!CALIBRATE_SENSOR)
+  {
+    init_encoder_from_saved_calibration();
+    sensor_calibrated = true;
+    // delay(5000);
+  }
+  return true;
+}
+
+#endif
+
 
 void update_motor_setpoint(char* setpoint)
 {
@@ -363,13 +514,25 @@ void calibrate_motor(char* value)
 
 // #define DEBUGPIN 18
 
-void setup() {
-  // UART_DEBUG.begin(SERIAL_SPEED);
-  // Serial.begin(SERIAL_SPEED);
-  // UART_INTERCHIP.begin(SERIAL_SPEED);
-  // pinMode(DEBUGPIN, OUTPUT);
-  // digitalWrite(DEBUGPIN, LOW);
+void setup1()
+{
+  delay(100);
+  
+  if(setup_induction_encoder())
+  {
+    rp2040.fifo.push(uint32_t(0.0f));
+  }
+  UART_DEBUG.println("CORE 1 SETUP COMPLETE");
 
+}
+
+// void exception_handler()
+// {
+//   rp2040.reboot();
+// }
+
+void setup() {
+  // exception_set_exclusive_handler(HARDFAULT_EXCEPTION, exception_handler);
   
 
   UART_DEBUG.setRX(25);
@@ -387,7 +550,13 @@ void setup() {
   pinMode(VDC_CS, OUTPUT);
   pinMode(VDC_CLK, OUTPUT);
   pinMode(VDC_DATA, INPUT);
+  if(USE_ESTOP_AS_PROFILE_PIN)
+  {
+    pinMode(ESTOP_SQUARE_INPUT_MOTOR, OUTPUT);
+  } else
+  {
   pinMode(ESTOP_SQUARE_INPUT_MOTOR, INPUT);
+  }
 
 
   commander.verbose = VerboseMode::user_friendly;
@@ -417,9 +586,11 @@ void setup() {
   motor1.linkDriver(&driver1);
 
 #ifdef INDUCTIVE_ENCODER
-// pinMode(ENCODER_RX, INPUT);
-// pinMode(ENCODER_TX, OUTPUT);
-encoder_software_serial.begin(57600);
+  // induction_encoder_setup_complete = setup_induction_encoder();
+  // if(!induction_encoder_setup_complete)
+  // {
+  //   error_codes |= ERROR_CODE_INDUCTION_ENCODER_OFFLINE;
+  // }
 #else
   setup_encoder();
   // sensor0.init();
@@ -499,17 +670,34 @@ encoder_software_serial.begin(57600);
 
   commander.add('M', onMotor0, "Drive Motor");
   commander.add('N', update_motor_setpoint, "Brushed Motor");
-  commander.add('C', calibrate_motor, "Calibrate");
+  commander.add('C', calibrate_motor, "Calibrate Motor");
+  commander.add('E', save_encoder_calibration, "Calibrate Encoder");
+  commander.add('G', clear_encoder_calibration, "Clear Encoder Calibration");
   // commander.add('U', onUtil, "Motor utilities");
 
 
   log_string("Startup complete.");
+  if(rp2040.fifo.available())
+  {
+    induction_encoder_setup_complete = true;
+    log_string("Encoder initialized.");
+    last_encoder_sample_millis = millis();
+  }
+  else
+  {
+    log_string("Encoder initialization failed.");
+  }
+
+   if(!induction_encoder_setup_complete)
+  {
+    error_codes |= ERROR_CODE_INDUCTION_ENCODER_OFFLINE;
+  }
 
   ts = millis();  
 
-  driver0.phase_state[0] = PHASE_ON;
-  driver0.phase_state[1] = PHASE_ON;
-  driver0.phase_state[2] = PHASE_ON;
+  driver0.phase_state[0] = PHASE_OFF;
+  driver0.phase_state[1] = PHASE_OFF;
+  driver0.phase_state[2] = PHASE_OFF;
   driver0.setPwm(0, 0, 0);
   sensor1.velocity_max = 1000.0f;
 
@@ -575,48 +763,175 @@ uint32_t loop_count_tick = 0;
 
 unsigned long vel_avg_timer = 0;
 unsigned long overspeed_monitor_timer = 0;
+unsigned long ts_encoder = 0;
 
+uint32_t encoder_read_state = 0;
+int32_t encoder_adc_value_1;
+int32_t encoder_adc_value_2;
+float initial_encoder_angle = 0.0f;
+float encoder_loop1_phase_offset_degrees = 0.0f;
+
+void loop1 () {
+
+  if(encoder_read_state == 0)
+  {
+    encoder_read_state = 1;
+    ads_encoder.startADCReading(ADS1X15_REG_CONFIG_MUX_DIFF_0_1, /*continuous=*/false);
+  }
+  if(encoder_read_state == 1 and ads_encoder.conversionComplete())
+  {
+    encoder_read_state = 2;
+    encoder_adc_value_1 = ads_encoder.getLastConversionResults();
+    ads_encoder.startADCReading(ADS1X15_REG_CONFIG_MUX_DIFF_2_3, /*continuous=*/false);
+  }
+  if(encoder_read_state == 2 and ads_encoder.conversionComplete())
+  {
+    encoder_read_state = 3;
+    encoder_adc_value_2 = ads_encoder.getLastConversionResults();
+  }
+  if(encoder_read_state == 3)
+  {
+
+    /* Be sure to update this value based on the IC and the gain settings! */
+    float   multiplier = 3.0F;    /* ADS1015 @ +/- 6.144V gain (12-bit results) */
+    //float multiplier = 0.1875F; /* ADS1115  @ +/- 6.144V gain (16-bit results) */
+
+    // encoder_adc_value_1 = ads_encoder.readADC_Differential_0_1();
+    // encoder_adc_value_2 = ads_encoder.readADC_Differential_2_3();
+
+    
+    if (not angle_phase_detected)
+    {
+      for (int i = 0; i < 8; i++) {
+      int16_t value;
+      if(i<4)
+        {
+          value = ads_mag_1.readADC_SingleEnded(i) - MAG_NEUTRAL;
+        } else {
+          value = ads_mag_2.readADC_SingleEnded(i-4) - MAG_NEUTRAL;
+        }
+        if (abs(value) < 5000)
+        {
+          value = 0;
+        } else
+        if (i==3 or i==4 or i==5 or i==6)
+        {
+          angle_phase = 1;
+          angle_phase_detected = true;
+          encoder_loop1_phase_offset_degrees = 360.0f;
+        } else
+        {
+          angle_phase = 0;
+          angle_phase_detected = true;
+        }
+        // print the ADC value of the channel
+        UART_DEBUG.print("value " + String(i) + ": " + String(value) + " | "); 
+      }
+    }
+    // UART_DEBUG.println();
+    
+    int sinValue = encoder_adc_value_1;
+    int cosValue = encoder_adc_value_2;
+
+    // debug_print("(Core1) sinValue: " + String(sinValue) + ", cosValue: " + String(cosValue));
+
+    sinMin = min(sinMin, sinValue);
+    sinMax = max(sinMax, sinValue);
+    cosMin = min(cosMin, cosValue);
+    cosMax = max(cosMax, cosValue);
+
+    // Calculate normalized readings (0.0 to 1.0)
+    float sinNorm = (sinValue - sinMin) / float(sinMax - sinMin);
+    float cosNorm = (cosValue - cosMin) / float(cosMax - cosMin);
+
+    sinNorm = sinNorm * 2.0 - 1.0;
+    cosNorm = cosNorm * 2.0 - 1.0;
+
+    float angleRad = atan2(sinNorm, cosNorm);
+
+    float angleDeg = angleRad * 180.0 / PI  + 180.0;
+
+    if (angle_phase_detected)
+    {
+      rp2040.fifo.push(uint32_t(angleDeg + encoder_loop1_phase_offset_degrees));
+      // debug_print("(Core1) Angle (Deg): " + String(angleDeg));
+    }else
+    {
+      rp2040.fifo.push(uint32_t(0.0f));
+    }
+
+    encoder_read_state = 0;
+
+    // delay(50);
+}
+
+}
+bool encoder_connection_stable = true;
+
+uint32_t getTotalHeap(void) {
+   extern char __StackLimit, __bss_end__;
+   
+   return &__StackLimit  - &__bss_end__;
+}
+
+uint32_t getFreeHeap(void) {
+   struct mallinfo m = mallinfo();
+
+   return getTotalHeap() - m.uordblks;
+}
 
 
 void loop(){
 
-  if (BOOTSEL)
-  {
-    if (!bootsel_pressed)
-    {
-      bootsel_pressed = true;
-      last_bootsel_millis = millis();
-    }
+
+
+  // if (BOOTSEL)
+  // {
+
+  //   log_string("Bootsel pressed.");
+  //   if (!bootsel_pressed)
+  //   {
+  //     bootsel_pressed = true;
+  //     last_bootsel_millis = millis();
+  //   }
     
+  // } else
+  // {
+  //   if (bootsel_pressed)
+  //   {
+  //     bootsel_pressed = false;
+  //     if (millis() - last_bootsel_millis > 5000)
+  //     {
+  //       log_string("Bootsel pressed for 5 seconds.  Recalibrating motor.");
+
+  //       // Make sure motor is enabled.
+  //       driver0.phase_state[0] = PHASE_ON;
+  //       driver0.phase_state[1] = PHASE_ON;
+  //       driver1.enable();
+
+  //       calibrate_motor("");
+
+  //       // Disable motor to be safe. Will be enabled by estop toggling if present.
+  //       driver0.setPwm(0, 0, 0);
+  //       driver0.phase_state[0] = PHASE_OFF;
+  //       driver0.phase_state[1] = PHASE_OFF;
+  //       driver1.disable();
+  //       motor1.target = 0.0f;
+  //       motion_allowed = false;
+  //     }
+  //   }
+
+  // }
+  int estop_val = 0;
+   if(USE_ESTOP_AS_PROFILE_PIN)
+  {
+    digitalWrite(ESTOP_SQUARE_INPUT_MOTOR, HIGH);
+    delayMicroseconds(100);
+    digitalWrite(ESTOP_SQUARE_INPUT_MOTOR, LOW);
   } else
   {
-    if (bootsel_pressed)
-    {
-      bootsel_pressed = false;
-      if (millis() - last_bootsel_millis > 5000)
-      {
-        log_string("Bootsel pressed for 5 seconds.  Recalibrating motor.");
-
-        // Make sure motor is enabled.
-        driver0.phase_state[0] = PHASE_ON;
-        driver0.phase_state[1] = PHASE_ON;
-        driver1.enable();
-
-        calibrate_motor("");
-
-        // Disable motor to be safe. Will be enabled by estop toggling if present.
-        driver0.setPwm(0, 0, 0);
-        driver0.phase_state[0] = PHASE_OFF;
-        driver0.phase_state[1] = PHASE_OFF;
-        driver1.disable();
-        motor1.target = 0.0f;
-        motion_allowed = false;
-      }
-    }
-
+   estop_val = digitalRead(ESTOP_SQUARE_INPUT_MOTOR);
   }
-
-  int estop_val = digitalRead(ESTOP_SQUARE_INPUT_MOTOR);
   if (estop_val != last_estop_val)
   {
     last_estop_val = estop_val;
@@ -673,14 +988,14 @@ void loop(){
     power_calc_tick = 0;
     system_voltage = read_system_voltage();
     driver1.voltage_power_supply = system_voltage;
-    if(system_voltage < MINIMUM_ALLOWED_MOTOR_VOLTAGE)
-    {
-      set_motors_disabled = true;
-    }
-    if(system_voltage > RESUME_MOTOR_VOLTAGE)
-    {
-      set_motors_enabled = true;
-    }
+    // if(system_voltage < MINIMUM_ALLOWED_MOTOR_VOLTAGE)
+    // {
+    //   set_motors_disabled = true;
+    // }
+    // if(system_voltage > RESUME_MOTOR_VOLTAGE)
+    // {
+    //   set_motors_enabled = true;
+    // }
     // loop through motor1 currents array, shifting each value down one and adding the new value to the end. then calculate the average.
     for(int i = 0; i<19; i++)
     {
@@ -714,58 +1029,121 @@ void loop(){
   }
 
 
-#ifdef INDUCTIVE_ENCODER
 
-
-if (encoder_ts + 100uL <= millis()) {
+// NOTE: when reading magnetic sensors, use ads_mag_1.readADC_SingleEnded(0);
+if ((encoder_ts + 100uL <= millis() or encoder_read_state > 0) and induction_encoder_setup_complete and rp2040.fifo.available()) {
   // debug_print("SENDING ENCODER REQUEST");
   encoder_ts = millis();
-  encoder_software_serial.write(0x55);
-  if(encoder_software_serial.available()) 
-  {
-    uint8_t buffer[2];
-    encoder_software_serial.readBytes(buffer, 2);
-    int16_t encoder_value = reinterpret_cast<int16_t &>(buffer);
-    // int16_t encoder_value = buffer[0] | buffer[1] << 8;
-    debug_print("GOT ENCODER VALUE: " + String(encoder_value));
-    bool phase_d = encoder_value & 0x01;
-    encoder_angle = (encoder_value)/20.0f;
-    debug_print("Angle (Deg): " + String(encoder_angle) + " | Phase: " + String(phase_d));
 
-
-
-    if (phase_d==0 or encoder_angle * DEGREES_TO_RADIANS > position_target + 0.1)
+    float steering_sensor_raw_electrical_angle_degrees = 0.0f;
+    bool read_success = false;
+    while(rp2040.fifo.available())
     {
-      driver0.setPwm(0, 24, 24);
-      debug_print("Move Forward " + String(encoder_angle * DEGREES_TO_RADIANS) + " " + String(position_target));
+      float fifo_read_val = float(rp2040.fifo.pop());
+      if(!induction_encoder_homing_complete)
+      {
+        induction_encoder_homing_complete = abs(fifo_read_val) > 0.001;
+      }
+      if(induction_encoder_homing_complete)
+      {
+        steering_sensor_raw_electrical_angle_degrees = fifo_read_val;
+        read_success = true;
+      }
     }
-    else if (encoder_angle * DEGREES_TO_RADIANS < position_target - 0.1)
+    last_encoder_sample_millis = millis();
+    if(read_success)
     {
-      driver0.setPwm(24, 0, 0);
-      debug_print("Move Backward " + String(encoder_angle * DEGREES_TO_RADIANS) + " " + String(position_target));
-    }else
-    {
-      driver0.setPwm(0, 0, 0);
-    }
+     
+     // Detect angle roll over and adjust angle loop offset
+      if (abs(last_steering_raw_angle_degrees - steering_sensor_raw_electrical_angle_degrees) > 90)
+      {
+        log_string("Angle jump!");
+        if(last_steering_raw_angle_degrees > steering_sensor_raw_electrical_angle_degrees)
+        {
+          angle_loop_offset_degrees += 360;
+          angle_phase = angle_phase==0 ? 1 : 0;
+        } else {
+          angle_loop_offset_degrees -= 360;
+          angle_phase = angle_phase==0 ? 1 : 0;
+
+        }
+      }
+      last_steering_raw_angle_degrees = steering_sensor_raw_electrical_angle_degrees;
+      // Two electrical phases per mechanical rotation, so divide by 2.
+      float corrected_angle_degrees = (steering_sensor_raw_electrical_angle_degrees + angle_loop_offset_degrees)/2.0;
+      steering_angle_radians = (corrected_angle_degrees * DEGREES_TO_RADIANS) + steering_home_offset_radians + DEFAULT_STEERING_ANGLE_OFFSET_RADIANS;
+      if(SHOW_STEERING_DEBUGGING)
+      {
+        if(millis() - last_steer_debug_print_time > 100)
+        {
+          float val = steering_angle_radians;
+          // float val = fmod(steering_angle_radians , (2*PI));
+          debug_print("steering_angle_radians: " + String(val));
+        last_steer_debug_print_time = millis();
+        }
+      }
     }
 }
-#else
-  // TODO: Add ramping.
-  if (encoder_pulse_counter * STEERING_COUNTS_TO_RADIANS > position_target + 0.005)
+
+if(millis() - last_encoder_sample_millis > 1000)
+{
+  error_codes |= ERROR_CODE_INDUCTION_ENCODER_OFFLINE;
+  if(encoder_connection_stable == true)
   {
-    driver0.setPwm(0, 24, 0);
-    debug_print("Move Forward " + String(encoder_pulse_counter * STEERING_COUNTS_TO_RADIANS) + " " + String(position_target));
+   debug_print("ERROR INDUCTION ENCODER OFFLINE! ");
   }
-  else if (encoder_pulse_counter * STEERING_COUNTS_TO_RADIANS < position_target - 0.005)
+  encoder_connection_stable = false;
+}
+else
+{
+  encoder_connection_stable = true;
+}
+  // TODO: Add ramping.
+  if(induction_encoder_homing_complete == false and encoder_connection_stable)
   {
-    driver0.setPwm(24, 0, 24);
-    debug_print("Move Backward " + String(encoder_pulse_counter * STEERING_COUNTS_TO_RADIANS) + " " + String(position_target));
+     driver0.setPwm(24, 0, 0); // force motor movement to initiate homing
+  }
+  else if (steering_angle_radians > position_target + 0.05 and encoder_connection_stable)
+  {
+    if(FLIP_STEERING)
+    {
+      driver0.setPwm(0, 24, 24);
+    } else
+    {
+      driver0.setPwm(24, 0, 0);
+    }
+    if(SHOW_STEERING_DEBUGGING_MOVEMENT)
+    {
+      if(millis() - last_steer_debug_print_time > 100)
+      {
+        debug_print("Move Forward " + String(steering_angle_radians) + " " + String(position_target));
+        last_steer_debug_print_time = millis();
+      }
+    }
+
+  }
+  else if (steering_angle_radians < position_target - 0.05 and encoder_connection_stable)
+  {
+    if(FLIP_STEERING)
+    {
+      driver0.setPwm(24, 0, 0);
+    } else
+    {
+      driver0.setPwm(0, 24, 24);
+    }
+    if(SHOW_STEERING_DEBUGGING_MOVEMENT)
+    { 
+      if(millis() - last_steer_debug_print_time > 100)
+      {
+        debug_print("Move Backward " + String(steering_angle_radians) + " " + String(position_target));
+        last_steer_debug_print_time = millis();
+      }
+    }
   }else
   {
     driver0.setPwm(0, 0, 0);
   }
-#endif
-
+  
 
   if(UART_INTERCHIP.available())
   {
@@ -824,7 +1202,7 @@ if (encoder_ts + 100uL <= millis()) {
         send_float_interchip(motor1_voltage_avg);
         int32_t drive_motor_position = sensor1.electric_rotations * 6 + sensor1.electric_sector;
         send_int_interchip(drive_motor_position); // Wheel ticks
-        send_int_interchip(encoder_pulse_counter); // Steering ticks
+        send_float_interchip(steering_angle_radians); // Steering angle
         send_float_interchip(motor1_velocity_avg); // Wheel velocity
         UART_INTERCHIP.write(byte(error_codes));
         last_motor_command_millis = millis();
@@ -850,7 +1228,7 @@ if (encoder_ts + 100uL <= millis()) {
           send_float_interchip(motor1_voltage_avg);
           int32_t drive_motor_position = sensor1.electric_rotations * 6 + sensor1.electric_sector;
           send_int_interchip(drive_motor_position); // Wheel ticks
-          send_int_interchip(encoder_pulse_counter); // Steering ticks
+          send_float_interchip(steering_angle_radians); // Steering angle
           send_float_interchip(motor1_velocity_avg); // Wheel velocity
           UART_INTERCHIP.write(byte(error_codes));
         }
@@ -864,6 +1242,10 @@ if (encoder_ts + 100uL <= millis()) {
       {
         debug_print("CLEAR_ERRORS");
         error_codes = 0;
+        if(!induction_encoder_setup_complete)
+        {
+          error_codes = ERROR_CODE_INDUCTION_ENCODER_OFFLINE;
+        }
         motor1.target = 0.0f;
       }
       else if (msgbuffer[0] == LOG_REQUEST && crcbuffer==crc)
@@ -880,10 +1262,10 @@ if (encoder_ts + 100uL <= millis()) {
       {
         send_firmware_status();
       }
-      else if (msgbuffer[0] == SET_STEERING_ZERO && crcbuffer==crc)
+      else if (msgbuffer[0] == SET_STEERING_HOME && crcbuffer==crc)
       {
-        encoder_pulse_counter = 0;
-        position_target = 0.0f;
+
+        memcpy (&steering_home_offset_radians, msgbuffer + 1, 4);
         UART_INTERCHIP.write(ACK, 2);
       }
 
@@ -898,8 +1280,23 @@ if (encoder_ts + 100uL <= millis()) {
       // debug_print("val debug: " + String(val1) + " " + String(val2) + " " + String(val3));
 
       msglen = val1 | val2<<8 | val3<<16;
+      uint32_t free_heap = getFreeHeap();
+      UART_DEBUG.print("getFreeHeap: ");
+      UART_DEBUG.print(free_heap);
+      UART_DEBUG.print(" | getTotalHeap: ");
+      UART_DEBUG.println(getTotalHeap());
 
-      uint8_t msgbuffer[msglen];
+      if(free_heap < msglen)
+      {
+        log_string("Not enough memory to receive OTA image.  Free heap: " + String(free_heap) + " Required: " + String(msglen));
+        UART_INTERCHIP.write(NACK, 2);  
+      } else
+      {
+      UART_INTERCHIP.write(ACK, 2);
+
+      uint8_t *msgbuffer; 
+      msgbuffer = (uint8_t*)malloc(msglen);
+
       UART_INTERCHIP.readBytes(msgbuffer, msglen);
       log_string("Writing OTA image of length " + String(msglen));
       LittleFS.begin();
@@ -919,6 +1316,7 @@ if (encoder_ts + 100uL <= millis()) {
       debug_print("Rebooting. Should launch with new app...");
       delay(2000);
       rp2040.reboot();
+      }
     }
   }
   motor1.PID_velocity.limit = DRIVE_VEL_LIMIT;
@@ -943,7 +1341,7 @@ if (encoder_ts + 100uL <= millis()) {
   // Overspeed monitoring
   if(abs(motor1_velocity_avg) - OVERSPEED_VEL_ALLOWANCE > abs(motor1.target))
   {
-    // debug_print("Overspeed detected!");
+    debug_print("Overspeed detected!");
     if(overspeed_monitor_timer == 0)
     {
       overspeed_monitor_timer = millis();
@@ -963,116 +1361,21 @@ if (encoder_ts + 100uL <= millis()) {
   }
 
 
-
-
-  // if (ts + 1000uL <= millis()) {
-  //   ts = millis();
-  //   // String myStr;    /*New string is defined*/
-  //   // myStr = String(max_estop_duration);   /*Convert Int to String*/
-  //   log_string(String(max_estop_duration));
-  //   max_estop_duration = 0;
-  // }
-
-
-
-//     // count++;
-    loop_count_tick++;
-    if (ts + 10uL < millis()) {
-      // DQCurrent_s current = current1.getFOCCurrents(motor1.electrical_angle);
-      // PhaseCurrent_s phase_currents = current1.getPhaseCurrents();
-      // // // if(halls!=lasthalls) {
-      // // // lasthalls = halls;
-      // int32_t drive_motor_position = sensor1.electric_rotations * 6 + sensor1.electric_sector;
-      // UART_DEBUG.println(String(sensor1.getVelocity()));
-      // // // float velocity = 10 *(last_position - position);
-      // // // last_position = position;
+  if(SHOW_DRIVE_DEBUGGING)
+  {
+    if (ts + 100uL < millis()) {
+      debug_print("Drive motor vel avg: " + String(motor1_velocity_avg) + " | Drive motor position:" + String(sensor1.getAngle()) + " | Halls: " + String(sensor1.A_active)  + String(sensor1.B_active) + String(sensor1.C_active) );
       ts = millis();
-      // // Serial.println(encoder_pulse_counter/1024.0f);
-      // UART_DEBUG.print(phase_currents.a);
-      // UART_DEBUG.print(" ");
-      // UART_DEBUG.print(phase_currents.b);
-      // UART_DEBUG.print(" ");
-      // UART_DEBUG.print(phase_currents.c);
-      // UART_DEBUG.print(" ");
-      // UART_DEBUG.print(current.d);
-      // UART_DEBUG.print(".");
-      // UART_DEBUG.println(current.q);
-      // // UART_DEBUG.println(String(motor1.current.d * motor1_voltage_avg) + " | " + String(motor1.current.q + system_voltage));
-      // // UART_DEBUG.println(String(motor1_voltage_avg * motor1_current_avg) + " watts, " + String(loop_count_tick * 5) + " Hz");
-      // loop_count_tick = 0;
-      // PhaseCurrent_s phase_currents = current1.getPhaseCurrents();
-      // float wattage = motor1.current.d * system_voltage;
-      // UART_DEBUG.print("Volts: " + String(system_voltage) + ", Current: " + String(motor1.current.d) + ", Watts: " + String(wattage) + ";\r\n");
-      // UART_DEBUG.print(String(phase_currents.a) + ", " + String(phase_currents.b) + ", " + String(phase_currents.c) + ";\r\n");
-}
-
-
-
-
-
-
-
-
-  // count++;
-  // if (ts + 1000uL < millis()) {
-  //   // if(halls!=lasthalls) {
-  //     // lasthalls = halls;
-
-  //   float position = sensor1.getAngle();
-
-  //   float velocity = 10 *(last_position - position);
-  //   last_position = position;
-
-  //   ts = millis();
-  //   SimpleFOCDebug::print("loop/s: ");
-  //   SimpleFOCDebug::print(int(count));
-  //   SimpleFOCDebug::print(" angle0: ");
-  //   SimpleFOCDebug::print(sensor0.getAngle());
-  //   SimpleFOCDebug::print(" angle1: ");
-  //   SimpleFOCDebug::print(sensor1.getAngle());
-  //   SimpleFOCDebug::print(" velocity1: ");
-  //   SimpleFOCDebug::print(sensor1.getVelocity());
-  //   // SimpleFOCDebug::print(" avg velocity: ");
-  //   // SimpleFOCDebug::print(velocity);
-  //   // SimpleFOCDebug::print(" A2: ");
-  //   // SimpleFOCDebug::print(analogRead(A2));
-  //   // SimpleFOCDebug::print(" A3: ");
-  //   // SimpleFOCDebug::print(analogRead(A3));
-  //   // // SimpleFOCDebug::print(" angle_diff: ");
-  //   // // SimpleFOCDebug::print(angle_diff);
-  //   // SimpleFOCDebug::print(" max_angle_diff: ");
-  //   // SimpleFOCDebug::print(max_angle_diff);
-  //   // SimpleFOCDebug::print(" |  dc_a: ");
-  //   // SimpleFOCDebug::print(driver1.dc_a);
-  //   // SimpleFOCDebug::print(" |  dc_b: ");
-  //   // SimpleFOCDebug::print(driver1.dc_b);
-  //   // SimpleFOCDebug::print(" |  dc_c: ");
-  //   // SimpleFOCDebug::print(driver1.dc_c);
-  //   // SimpleFOCDebug::print(" |  motor1.voltage.d: ");
-  //   // SimpleFOCDebug::print(motor1.voltage.d);
-  //   // SimpleFOCDebug::print(" |  motor1.voltage.q: ");
-  //   // SimpleFOCDebug::print(motor1.voltage.q);
-  //   // SimpleFOCDebug::print(" | HALLS: ");
-  //   // SimpleFOCDebug::print(pinA);
-  //   // SimpleFOCDebug::print("-");
-  //   // SimpleFOCDebug::print(pinB);
-  //   // SimpleFOCDebug::print("-");
-  //   // SimpleFOCDebug::print(pinC);
-  //   // SimpleFOCDebug::print(" | ");
-  //   // SimpleFOCDebug::print(halls);
-  //   // SimpleFOCDebug::print(" | ");
-  //   // for(int i=0;i<halls;i++)
-  //   // {
-  //   //   SimpleFOCDebug::print("<=============>");
-  //   // }
-  //   // SimpleFOCDebug::println();
-  //   SimpleFOCDebug::print(", sensor1.electric_sector: ");
-  //   SimpleFOCDebug::println(int(sensor1.electric_sector));
-
+   }
     
-  //   count = 0;
-  // }
+  }
 
+
+  //   loop_count_tick++;
+  //   if (ts + 1000uL < millis()) {
+  //     UART_DEBUG.println("Loop 5");
+  //     ts = millis();
+  //  }
 
 
   commander.run();

@@ -12,16 +12,23 @@
 #include <LittleFS.h>
 #include <hardware/exception.h>
 #include <Adafruit_NeoPixel.h>
+#include <Wire.h>
+#include <PCA9557.h>
 
 #define MCP_CS 9
 #define MCP_INT 4
 #define SPI1_MISO 8
 #define SPI1_MOSI 11
 #define SPI1_SCLK 10
+#define SDA1 18
+#define SCL1 19
 
+#define DISABLE_ESTOP false
 
 MCP_CAN CAN0(&SPI1, MCP_CS);
 IsoTp isotp(&CAN0, MCP_INT);
+
+PCA9557 io(0x18, &Wire1);
 
 
 #define THERM_ADC_CLK 2
@@ -61,14 +68,11 @@ float motor2_acceleration = 0.0;
 #define LOG_REQUEST 10
 #define RAW_BRIDGE_COMMAND 11
 #define FIRMWARE_STATUS 12
-#define SET_STEERING_ZERO 13
+#define SET_STEERING_HOME 13
 #define CLEAR_ERRORS 14
 
 const byte ACK[] = {0xAC, 0x12};
 
-#define CAN_ID_1 18
-#define CAN_ID_2 19
-#define CAN_ID_3 23
 #define ESTOP_SWITCH_STATUS 16
 #define ESTOP_SQUARE_INPUT 14
 #define AUX_1_GPIO 6
@@ -115,7 +119,7 @@ uint32_t logger_index = 0;
 bool logger_filled = false;
 
 
-#define PRINT_LOGGING true
+#define PRINT_LOGGING false
 #define USE_CAN_CPU_LOGGING  true
 
 #define SERIAL_SPEED 921600
@@ -222,6 +226,16 @@ void setup()
 
   // CAN0.mcp2515_reset();
 
+  Wire1.setSDA(SDA1);
+  Wire1.setSCL(SCL1);
+  Wire1.setClock(10000); //Forgot to add pullups on the board so run slowly. Internal pullups (~100k) do get enabled by the library so it works.
+  Wire1.begin();
+
+  io.pinMode(0, INPUT); // Config IO0 of PCA9557 to INPUT mode
+  io.pinMode(1, INPUT); // Config IO1 of PCA9557 to INPUT mode
+  io.pinMode(2, INPUT); // Config IO2 of PCA9557 to INPUT mode
+
+
   strip.begin();
   strip.show();
   strip.setBrightness(50);
@@ -280,13 +294,10 @@ void setup()
   pinMode(ADC_MOTOR_TH1, INPUT);
   pinMode(ADC_MOTOR_TH2, INPUT);
 
-  pinMode(CAN_ID_1, INPUT);
-  pinMode(CAN_ID_2, INPUT);
-  pinMode(CAN_ID_3, INPUT);
 
   attachInterrupt(digitalPinToInterrupt(ESTOP_SQUARE_INPUT), handle_estop, CHANGE);
   
-  rx_can_id = CAN_BASE_ADDRESS + (digitalRead(CAN_ID_1)<<2 | digitalRead(CAN_ID_2)<<1 | digitalRead(CAN_ID_3));
+  rx_can_id = CAN_BASE_ADDRESS + ((!io.digitalRead(0))<<2 | (!io.digitalRead(1))<<1 | (!io.digitalRead(2)));
 
   debug_print("Setting CAN ID " + String(rx_can_id));
 
@@ -369,6 +380,19 @@ void send_buffer_interchip()
 {
     uint32_t crc;
     crc =  crc16(rxMsg.Buffer, rxMsg.len);
+    
+    // Check the buffer from the interchip UART. It should be empty.
+    // If it is not empty, read it and print an error with
+    // information about the contents.
+    if (UART_INTERCHIP.available() > 0) {
+      char serialbuffer[50];
+      int readlength = UART_INTERCHIP.available();
+      UART_INTERCHIP.readBytes(serialbuffer, readlength);
+      debug_print("Interchip UART buffer not empty. Got " + String(readlength) + " bytes.");
+      debug_print(String((char *)serialbuffer));
+    }
+
+
     UART_INTERCHIP.write(rxMsg.len);
     UART_INTERCHIP.write(rxMsg.Buffer, rxMsg.len);
     UART_INTERCHIP.write((uint8_t)(0xFF & crc));
@@ -433,7 +457,7 @@ void send_logging_reply(byte* log_array, uint32_t length)
 }
 
 // TODO: Some of the stuff that says motor1 is really motor2 and should just be changed to drive_motor
-void send_sensors_can(float system_voltage, float motor1_current, float motor1_voltage, int32_t drive_motor_position, int32_t encoder_pulse_counter, float motor1_velocity, uint8_t error_codes)
+void send_sensors_can(float system_voltage, float motor1_current, float motor1_voltage, int32_t drive_motor_position, float steering_angle_radians, float motor1_velocity, uint8_t error_codes)
 {
       for (int i = 26; i < 30; ++i) {
       gpio_disable_pulls(i);
@@ -476,7 +500,7 @@ void send_sensors_can(float system_voltage, float motor1_current, float motor1_v
     memcpy (txMsg.Buffer+15, &motor1_current, 4);
     memcpy (txMsg.Buffer+19, &motor1_voltage, 4);
     memcpy (txMsg.Buffer+23, &drive_motor_position, 4);
-    memcpy (txMsg.Buffer+27, &encoder_pulse_counter, 4);
+    memcpy (txMsg.Buffer+27, &steering_angle_radians, 4);
     memcpy (txMsg.Buffer+31, &motor1_velocity, 4);
     txMsg.Buffer[35] = error_codes;
 
@@ -501,12 +525,23 @@ void send_sensors_can(float system_voltage, float motor1_current, float motor1_v
 #define SEND_THERMISTOR_TO_MOTOR_MCU false
 
 
+bool recieve_ACK()
+{
+  byte rxbuf[2];
+  UART_INTERCHIP.readBytes(rxbuf, 2);
+  if(rxbuf[0] == ACK[0] && rxbuf[1] == ACK[1])
+  {
+    return true;
+  } else
+  {
+    return false;
+  }
+}
 
 
 void loop()
 {
 
-  rx_can_id = CAN_BASE_ADDRESS + (digitalRead(CAN_ID_1)<<2 | digitalRead(CAN_ID_2)<<1 | digitalRead(CAN_ID_3));
   rxMsg.rx_id = rx_can_id;
   // CAN0.mcp2515_write_id(0x1, 0,rx_can_id);
 
@@ -518,6 +553,10 @@ void loop()
     max_estop_duration = estop_duration;
   }
   bool motion_tmp = (estop_duration < ESTOP_DURATION_MS);
+  if(DISABLE_ESTOP)
+  {
+    motion_tmp = true;
+  }
   if(motion_tmp!=motion_allowed)
   {
     motion_allowed = motion_tmp;
@@ -623,12 +662,12 @@ void loop()
             UART_INTERCHIP.readBytes(rxbuf, 4);
             int32_t drive_motor_position = reinterpret_cast<int32_t &>( rxbuf);
             UART_INTERCHIP.readBytes(rxbuf, 4);
-            int32_t encoder_pulse_counter = reinterpret_cast<int32_t &>( rxbuf);
+            float steering_angle_radians = reinterpret_cast<float &>( rxbuf);
             UART_INTERCHIP.readBytes(rxbuf, 4);
             float motor1_velocity = reinterpret_cast<float &>( rxbuf);
             UART_INTERCHIP.readBytes(rxbuf, 1);
             uint8_t error_codes = rxbuf[0];
-            send_sensors_can(system_voltage, motor1_current, motor1_voltage, drive_motor_position, encoder_pulse_counter, motor1_velocity, error_codes);
+            send_sensors_can(system_voltage, motor1_current, motor1_voltage, drive_motor_position, steering_angle_radians, motor1_velocity, error_codes);
           }
 
         }
@@ -646,26 +685,25 @@ void loop()
           UART_INTERCHIP.readBytes(rxbuf, 4);
           int32_t drive_motor_position = reinterpret_cast<int32_t &>( rxbuf);
           UART_INTERCHIP.readBytes(rxbuf, 4);
-          int32_t encoder_pulse_counter = reinterpret_cast<int32_t &>( rxbuf);
+          float steering_angle_radians = reinterpret_cast<float &>( rxbuf);
           UART_INTERCHIP.readBytes(rxbuf, 4);
           float motor1_velocity = reinterpret_cast<float &>( rxbuf);
           UART_INTERCHIP.readBytes(rxbuf, 1);
           uint8_t error_codes = rxbuf[0];
-          debug_print("drive_motor_position: " + String(drive_motor_position) + ", encoder_pulse_counter: " + String(encoder_pulse_counter) + ", motor1_velocity: " + String(motor1_velocity));
-          send_sensors_can(system_voltage, motor1_current, motor1_voltage, drive_motor_position, encoder_pulse_counter, motor1_velocity, error_codes);
+          log_string("drive_motor_position: " + String(drive_motor_position) + ", steering_angle_radians: " + String(steering_angle_radians) + ", motor1_velocity: " + String(motor1_velocity));
+          send_sensors_can(system_voltage, motor1_current, motor1_voltage, drive_motor_position, steering_angle_radians, motor1_velocity, error_codes);
 
         }
         else if (rxMsg.Buffer[0] == SIMPLE_PING)
         {
           debug_print("SIMPLE_PING");
           send_buffer_interchip();
-          byte rxbuf[2];
-          UART_INTERCHIP.readBytes(rxbuf, 2);
-          if(rxbuf[0] == ACK[0] && rxbuf[1] == ACK[1])
+          if(recieve_ACK())
           {
+            debug_print("GOT PING FROM MOTOR");
             send_ping_reply(true);
           } else
-          {
+          { debug_print("ERROR NO FROM MOTOR");
             send_ping_reply(false);
           }
         }
@@ -701,13 +739,11 @@ void loop()
           send_buffer_interchip();
           // TODO: Complete this stub.
         }
-        else if (rxMsg.Buffer[0] == SET_STEERING_ZERO)
+        else if (rxMsg.Buffer[0] == SET_STEERING_HOME)
         {
-          debug_print("SET_STEERING_ZERO");
+          debug_print("SET_STEERING_HOME");
           send_buffer_interchip();
-          byte rxbuf[2];
-          UART_INTERCHIP.readBytes(rxbuf, 2);
-          if(rxbuf[0] == ACK[0] && rxbuf[1] == ACK[1])
+          if(recieve_ACK())
           {
             send_ping_reply(true);
           } else
@@ -784,8 +820,11 @@ void loop()
           UART_INTERCHIP.write((rxMsg.len)&0xFF);
           UART_INTERCHIP.write((rxMsg.len>>8)&0xFF);
           UART_INTERCHIP.write((rxMsg.len>>16)&0xFF);
-          UART_INTERCHIP.write(rxMsg.Buffer+5, rxMsg.len);
 
+          if(recieve_ACK())
+          {
+            UART_INTERCHIP.write(rxMsg.Buffer+5, rxMsg.len);
+          }
 
         }
       }
