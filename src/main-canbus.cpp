@@ -301,7 +301,7 @@ void setup()
 
   debug_print("Setting CAN ID " + String(rx_can_id));
 
-  CAN0.begin(MCP_STDEXT, CAN_500KBPS, MCP_16MHZ);
+  CAN0.begin(MCP_STDEXT, CAN_100KBPS, MCP_16MHZ);
   CAN0.setMode(MCP_NORMAL);
 
   // CAN0.init_Mask(0,0,0x07FF0000);                // Init first mask...

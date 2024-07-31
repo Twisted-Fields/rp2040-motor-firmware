@@ -41,9 +41,11 @@ with a timer if no motion is detected.
 #endif
 
 
+// TODO: IF STEERING ANGLE INCREASES DURING HOMING, KILL IT!
+
 #define PRE_INITIALIZED_STARTUP true
 #define DISABLE_ESTOP false
-#define FLIP_STEERING true //true for motor above bearing designs, false for motor below bearing designs like Woody
+#define FLIP_STEERING false //true for motor above bearing designs, false for motor below bearing designs like Woody
 #define SHOW_STEERING_DEBUGGING false
 #define SHOW_STEERING_DEBUGGING_MOVEMENT false
 #define SHOW_DRIVE_DEBUGGING false
@@ -141,7 +143,7 @@ bool logger_filled = false;
 
 #define PRINT_LOGGING true
 
-#define INDUCTIVE_ENCODER
+#define DEBUG_PRINT_THROTTLE_DURATION_MS 10uL
 
 #define USE_ESTOP_AS_PROFILE_PIN false
 
@@ -206,12 +208,19 @@ uint8_t error_codes = 0;
 // float phase_currents[ARRAY_SIZE][9];
 // int phase_count = 0;
 
+uint32_t last_debug_print_time = 0;
+
 void debug_print(String text){
   if(UART_DEBUG)
   { 
     // UART_DEBUG.println("Length: ");
     // UART_DEBUG.println(text.length());
-    UART_DEBUG.println(text);
+    // if(last_debug_print_time + DEBUG_PRINT_THROTTLE_DURATION_MS < millis())
+    // {
+    //   last_debug_print_time = millis();
+    // }
+      UART_DEBUG.println(text);
+
     // char char_array[text.length()+1];
     // text.toCharArray(char_array, text.length()+1);
     // UART_DEBUG.println("Char array: ");
@@ -228,6 +237,8 @@ void log_string(String text)
   text.toCharArray(char_array, text.length()+1);
   log_string(char_array);
 }
+
+
 
 void log_string(const char* text)
 {
@@ -256,13 +267,13 @@ void log_string(const char* text)
 
 }
 
-#ifdef INDUCTIVE_ENCODER
 
 #define CALIBRATE_SENSOR false
 
 #define MAG_NEUTRAL 13222
 
-#define DEFAULT_STEERING_ANGLE_OFFSET_DEGREES (-17.0)
+#define DEFAULT_STEERING_ANGLE_OFFSET_DEGREES (90.0-17.0)
+// #define DEFAULT_STEERING_ANGLE_OFFSET_DEGREES (-17.0)
 
 #define DEFAULT_STEERING_ANGLE_OFFSET_RADIANS (DEFAULT_STEERING_ANGLE_OFFSET_DEGREES * DEGREES_TO_RADIANS)
 
@@ -409,8 +420,6 @@ bool setup_induction_encoder()
   }
   return true;
 }
-
-#endif
 
 
 void update_motor_setpoint(char* setpoint)
@@ -585,17 +594,6 @@ void setup() {
 
   motor1.linkDriver(&driver1);
 
-#ifdef INDUCTIVE_ENCODER
-  // induction_encoder_setup_complete = setup_induction_encoder();
-  // if(!induction_encoder_setup_complete)
-  // {
-  //   error_codes |= ERROR_CODE_INDUCTION_ENCODER_OFFLINE;
-  // }
-#else
-  setup_encoder();
-  // sensor0.init();
-  // sensor0.enableInterrupts(handleA0, handleB0, handleZ0);
-#endif
   sensor1.init();
   sensor1.enableInterrupts(handleA1, handleB1, handleC1);
 
@@ -605,7 +603,7 @@ void setup() {
   motor1.voltage_limit = DEFAULT_VOLTAGE_LIMIT;
   motor1.voltage_sensor_align = ALIGNMENT_VOLTAGE_LIMIT;
   motor1.velocity_limit = DRIVE_VEL_LIMIT; // 200rad/s is pretty fast
-  motor1.PID_velocity.P = 0.3f;
+  motor1.PID_velocity.P = 0.2f;
   motor1.PID_velocity.I = 0.0f;
   motor1.PID_velocity.D = 0.01f;
   motor1.PID_velocity.output_ramp = 200.0f;
@@ -620,9 +618,9 @@ void setup() {
   motor1.target = 0.0f;
 
   // foc current control parameters
-  motor1.PID_current_q.P = 1;
+  motor1.PID_current_q.P = 0.75;
   motor1.PID_current_q.I = 0;
-  motor1.PID_current_d.P = 1;
+  motor1.PID_current_d.P = 0.75;
   motor1.PID_current_d.I = 0;
   motor1.LPF_current_q.Tf = 0.01; 
   motor1.LPF_current_d.Tf = 0.01; 
@@ -833,6 +831,7 @@ void loop1 () {
     int sinValue = encoder_adc_value_1;
     int cosValue = encoder_adc_value_2;
 
+    
     // debug_print("(Core1) sinValue: " + String(sinValue) + ", cosValue: " + String(cosValue));
 
     sinMin = min(sinMin, sinValue);
@@ -879,6 +878,8 @@ uint32_t getFreeHeap(void) {
 
    return getTotalHeap() - m.uordblks;
 }
+
+uint32_t overspeed_monitor_print_time = 0;
 
 
 void loop(){
@@ -1101,16 +1102,16 @@ else
   // TODO: Add ramping.
   if(induction_encoder_homing_complete == false and encoder_connection_stable)
   {
-     driver0.setPwm(24, 0, 0); // force motor movement to initiate homing
+     driver0.setPwm(20, 0, 0); // force motor movement to initiate homing
   }
   else if (steering_angle_radians > position_target + 0.05 and encoder_connection_stable)
   {
     if(FLIP_STEERING)
     {
-      driver0.setPwm(0, 24, 24);
+      driver0.setPwm(0, 20, 20);
     } else
     {
-      driver0.setPwm(24, 0, 0);
+      driver0.setPwm(20, 0, 0);
     }
     if(SHOW_STEERING_DEBUGGING_MOVEMENT)
     {
@@ -1341,7 +1342,11 @@ else
   // Overspeed monitoring
   if(abs(motor1_velocity_avg) - OVERSPEED_VEL_ALLOWANCE > abs(motor1.target))
   {
-    debug_print("Overspeed detected!");
+    if(overspeed_monitor_print_time + 100uL < millis())
+    {
+      overspeed_monitor_print_time = millis();
+      debug_print("Overspeed detected!");
+    }
     if(overspeed_monitor_timer == 0)
     {
       overspeed_monitor_timer = millis();
