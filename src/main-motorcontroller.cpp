@@ -43,9 +43,17 @@ with a timer if no motion is detected.
 
 // TODO: IF STEERING ANGLE INCREASES DURING HOMING, KILL IT!
 
+// #define ROBOT_IS_ACORN
+#define ROBOT_IS_WOODY
+
 #define PRE_INITIALIZED_STARTUP true
 #define DISABLE_ESTOP false
+#ifdef ROBOT_IS_ACORN
+#define FLIP_STEERING true //true for motor above bearing designs, false for motor below bearing designs like Woody
+#endif
+#ifdef ROBOT_IS_WOODY
 #define FLIP_STEERING false //true for motor above bearing designs, false for motor below bearing designs like Woody
+#endif
 #define SHOW_STEERING_DEBUGGING false
 #define SHOW_STEERING_DEBUGGING_MOVEMENT false
 #define SHOW_DRIVE_DEBUGGING false
@@ -84,7 +92,7 @@ uint32_t last_steer_debug_print_time = 0;
 const byte ACK[] = {0xAC, 0x12};
 const byte NACK[] = {0x00, 0x00};
 
-#define MAXIMUM_ABSOLUTE_DRIVE_VELOCITY 200.0f
+#define MAXIMUM_ABSOLUTE_DRIVE_VELOCITY 300.0f
 
 
 #define ERROR_CODE_MOTOR1_OVERSPEED 0x01
@@ -93,7 +101,7 @@ const byte NACK[] = {0x00, 0x00};
 #define ERROR_CODE_INDUCTION_ENCODER_OFFLINE 0x08
 
 #define OVERSPEED_DURATION_ALLOWANCE_MS 1000
-#define OVERSPEED_VEL_ALLOWANCE 5.0f
+#define OVERSPEED_VEL_ALLOWANCE 20.0f
 
 
 
@@ -272,8 +280,12 @@ void log_string(const char* text)
 
 #define MAG_NEUTRAL 13222
 
+#ifdef ROBOT_IS_ACORN
+#define DEFAULT_STEERING_ANGLE_OFFSET_DEGREES (-17.0)
+#endif
+#ifdef ROBOT_IS_WOODY
 #define DEFAULT_STEERING_ANGLE_OFFSET_DEGREES (90.0-17.0)
-// #define DEFAULT_STEERING_ANGLE_OFFSET_DEGREES (-17.0)
+#endif
 
 #define DEFAULT_STEERING_ANGLE_OFFSET_RADIANS (DEFAULT_STEERING_ANGLE_OFFSET_DEGREES * DEGREES_TO_RADIANS)
 
@@ -603,7 +615,7 @@ void setup() {
   motor1.voltage_limit = DEFAULT_VOLTAGE_LIMIT;
   motor1.voltage_sensor_align = ALIGNMENT_VOLTAGE_LIMIT;
   motor1.velocity_limit = DRIVE_VEL_LIMIT; // 200rad/s is pretty fast
-  motor1.PID_velocity.P = 0.2f;
+  motor1.PID_velocity.P = 0.3f;
   motor1.PID_velocity.I = 0.0f;
   motor1.PID_velocity.D = 0.01f;
   motor1.PID_velocity.output_ramp = 200.0f;
@@ -618,9 +630,9 @@ void setup() {
   motor1.target = 0.0f;
 
   // foc current control parameters
-  motor1.PID_current_q.P = 0.75;
+  motor1.PID_current_q.P = 1.0;
   motor1.PID_current_q.I = 0;
-  motor1.PID_current_d.P = 0.75;
+  motor1.PID_current_d.P = 1.0;
   motor1.PID_current_d.I = 0;
   motor1.LPF_current_q.Tf = 0.01; 
   motor1.LPF_current_d.Tf = 0.01; 
